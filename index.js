@@ -18,7 +18,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const axios = require('axios'); // Added for GitHub API
+const axios = require('axios');
 
 const client = new Client({
   intents: [
@@ -31,8 +31,10 @@ const client = new Client({
 const app = express();
 app.use(express.json());
 
+// File Paths
 const KEYS_FILE = path.join(__dirname, 'keys.json');
 const AUTH_FILE = path.join(__dirname, 'auth_users.json');
+const USERS_FILE = path.join(__dirname, 'app_users.json');
 
 // Hardcoded authorized user IDs
 const PRE_AUTHORIZED_USERS = ['1476771914751017163', '1498853751354560634'];
@@ -57,15 +59,12 @@ async function syncKeysToGitHub(keysData) {
   };
 
   try {
-    // 1. Get current file SHA hash from GitHub
     const getRes = await axios.get(url, { headers });
     const currentSha = getRes.data.sha;
 
-    // 2. Extract key strings into array format: ["ZEN-XXX", "ZEN-YYY"]
     const keyArray = Object.keys(keysData);
     const updatedContent = Buffer.from(JSON.stringify(keyArray, null, 2)).toString('base64');
 
-    // 3. Push updated array back to GitHub
     await axios.put(url, {
       message: 'Bot auto-updated keys.json',
       content: updatedContent,
@@ -78,22 +77,17 @@ async function syncKeysToGitHub(keysData) {
   }
 }
 
-// --- File Handling ---
+// --- Local File Storage Helpers ---
 function loadKeys() {
   if (!fs.existsSync(KEYS_FILE)) {
     fs.writeFileSync(KEYS_FILE, JSON.stringify({}, null, 2));
     return {};
   }
-  try {
-    return JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
-  } catch (e) {
-    return {};
-  }
+  try { return JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch (e) { return {}; }
 }
 
 function saveKeys(keysData) {
   fs.writeFileSync(KEYS_FILE, JSON.stringify(keysData, null, 2));
-  // Auto-sync to GitHub whenever keys file is saved
   syncKeysToGitHub(keysData);
 }
 
@@ -113,22 +107,27 @@ function saveAuthUsers(data) {
   fs.writeFileSync(AUTH_FILE, JSON.stringify(data, null, 2));
 }
 
-// --- Duration Parser & Expiration Helpers ---
+function loadAppUsers() {
+  if (!fs.existsSync(USERS_FILE)) {
+    fs.writeFileSync(USERS_FILE, JSON.stringify({}, null, 2));
+    return {};
+  }
+  try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) { return {}; }
+}
+
+function saveAppUsers(usersData) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(usersData, null, 2));
+}
+
+// --- Duration Parser ---
 function parseDuration(input) {
   let str = '';
-  
   if (typeof input === 'object' && input !== null) {
     const dataObj = input.data || input;
-
     const parts = [
-      dataObj.product_name,
-      dataObj.variant_name,
-      dataObj.duration,
-      dataObj.product?.name,
-      dataObj.product?.title,
-      dataObj.variant?.name,
-      dataObj.variant?.title,
-      dataObj.title,
+      dataObj.product_name, dataObj.variant_name, dataObj.duration,
+      dataObj.product?.name, dataObj.product?.title,
+      dataObj.variant?.name, dataObj.variant?.title, dataObj.title,
       JSON.stringify(input)
     ].filter(Boolean);
     str = parts.join(' ').toLowerCase();
@@ -151,13 +150,182 @@ function parseDuration(input) {
   if (str.includes('day') || str.includes('1d') || str.includes('24h') || str.includes('1 day')) {
     return { label: '1 Day', durationDays: 1, isLifetime: false };
   }
-
   return { label: '1 Day', durationDays: 1, isLifetime: false };
 }
+
+// --- Web Server Endpoints ---
 
 app.get('/', (req, res) => {
   res.send('Z E N Bot Operational.');
 });
+
+// 1. Account Registration Endpoint (for Form1.cs)
+app.post('/api/register', (req, res) => {
+  const { username, password, key, hwid } = req.body;
+  if (!username || !password || !key || !hwid) {
+    return res.status(400).json({ success: false, message: 'All fields are required.' });
+  }
+
+  const keysData = loadKeys();
+  const keyObj = keysData[key];
+
+  if (!keyObj) {
+    return res.status(400).json({ success: false, message: 'Invalid license key.' });
+  }
+  if (keyObj.redeemed) {
+    return res.status(400).json({ success: false, message: 'License key has already been redeemed.' });
+  }
+
+  const appUsers = loadAppUsers();
+  if (appUsers[username.toLowerCase()]) {
+    return res.status(400).json({ success: false, message: 'Username is already taken.' });
+  }
+
+  const now = new Date();
+  keyObj.redeemed = true;
+  keyObj.redeemedBy = username;
+  keyObj.redeemedAt = now.toISOString();
+
+  if (keyObj.isLifetime || keyObj.durationDays === null || keyObj.duration === 'Lifetime') {
+    keyObj.expiresAt = 'Never';
+    keyObj.isLifetime = true;
+  } else {
+    const days = keyObj.durationDays || 1;
+    keyObj.expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  appUsers[username.toLowerCase()] = {
+    username: username,
+    password: password,
+    hwid: hwid,
+    key: key,
+    createdAt: now.toISOString()
+  };
+
+  saveKeys(keysData);
+  saveAppUsers(appUsers);
+
+  res.json({ success: true, message: 'Account registered successfully.' });
+});
+
+// 2. Account Login Endpoint (for Form1.cs)
+app.post('/api/login', (req, res) => {
+  const { username, password, hwid } = req.body;
+  if (!username || !password || !hwid) {
+    return res.status(400).json({ success: false, message: 'Username, password, and HWID are required.' });
+  }
+
+  const appUsers = loadAppUsers();
+  const userObj = appUsers[username.toLowerCase()];
+
+  if (!userObj || userObj.password !== password) {
+    return res.status(400).json({ success: false, message: 'Invalid username or password.' });
+  }
+
+  // Auto-bind HWID if reset previously via Discord modal
+  if (!userObj.hwid || userObj.hwid === '') {
+    userObj.hwid = hwid;
+    saveAppUsers(appUsers);
+  } else if (userObj.hwid !== hwid) {
+    return res.status(403).json({ success: false, message: 'HWID mismatch. Reset your HWID via Discord panel.' });
+  }
+
+  const keysData = loadKeys();
+  const keyObj = keysData[userObj.key];
+
+  if (keyObj && !keyObj.isLifetime && keyObj.expiresAt && keyObj.expiresAt !== 'Never') {
+    if (new Date() > new Date(keyObj.expiresAt)) {
+      return res.status(403).json({ success: false, message: 'Your subscription key has expired.' });
+    }
+  }
+
+  res.json({ success: true, message: 'Login successful.' });
+});
+
+// 3. Direct Key Verification Endpoint
+app.post('/api/verify-key', (req, res) => {
+  const { key } = req.body;
+  if (!key) return res.status(400).json({ success: false, message: 'Key required' });
+
+  const keysData = loadKeys();
+  const keyObj = keysData[key];
+
+  if (!keyObj) {
+    return res.status(404).json({ success: false, message: 'Invalid Key' });
+  }
+
+  if (!keyObj.redeemed) {
+    return res.status(403).json({ success: false, message: 'Key not redeemed yet. Redeem in Discord first.' });
+  }
+
+  const isExpired = !keyObj.isLifetime && (new Date() > new Date(keyObj.expiresAt));
+
+  if (isExpired) {
+    return res.status(403).json({ success: false, message: 'Key Expired' });
+  }
+
+  res.json({
+    success: true,
+    key: key,
+    duration: keyObj.duration,
+    expiresAt: keyObj.expiresAt,
+    isLifetime: keyObj.isLifetime,
+    redeemed: keyObj.redeemed
+  });
+});
+
+// 4. SellAuth Webhook Endpoint
+app.post('/webhook/sellauth', async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const durationData = parseDuration(payload);
+
+    const generatedKey = `ZEN-${crypto.randomBytes(4).toString('hex').toUpperCase()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    const createdAt = new Date().toISOString();
+
+    const dataObj = payload.data || payload;
+    const productName = dataObj.product_name || dataObj.product?.name || dataObj.product?.title || 'Z E N Enhancement';
+
+    const keysData = loadKeys();
+    keysData[generatedKey] = {
+      product: productName,
+      duration: durationData.label,
+      durationDays: durationData.durationDays,
+      createdAt: createdAt,
+      expiresAt: null,
+      isLifetime: durationData.isLifetime,
+      redeemed: false,
+      redeemedBy: null,
+      redeemedAt: null
+    };
+    saveKeys(keysData);
+
+    res.status(200).send(generatedKey);
+
+    const purchaseChannelId = process.env.PURCHASE_CHANNEL_ID || '1553943678014333090';
+    const channel = await client.channels.fetch(purchaseChannelId).catch(() => null);
+    if (channel) {
+      const embed = new EmbedBuilder()
+        .setTitle('🛒 New Purchase — Key Created!')
+        .setColor('#00FF7F')
+        .addFields(
+          { name: '📦 Product', value: `${keysData[generatedKey].product}`, inline: true },
+          { name: '⏳ Duration', value: `\`${durationData.label}\``, inline: true },
+          { name: '⏰ Expiration Date', value: `\`Timer starts upon redemption (${durationData.label})\``, inline: false },
+          { name: '🔑 Generated Key', value: `\`\`\`${generatedKey}\`\`\``, inline: false }
+        )
+        .setTimestamp();
+      await channel.send({ embeds: [embed] });
+    }
+  } catch (error) {
+    console.error('Webhook processing error:', error);
+    if (!res.headersSent) {
+      res.status(500).send('Webhook Processing Error');
+    }
+  }
+});
+
+// --- Discord Client Logic ---
 
 client.once('ready', async () => {
   console.log(`Bot logged in as ${client.user.tag}`);
@@ -185,20 +353,13 @@ client.once('ready', async () => {
 const DOWNLOAD_URL = (() => {
   const raw = (process.env.DOWNLOAD_URL || '').trim();
   if (!raw) return 'https://example.com';
-  try {
-    return new URL(raw).toString();
-  } catch {
-    try {
-      return new URL(`https://${raw}`).toString();
-    } catch {
-      return 'https://example.com';
-    }
+  try { return new URL(raw).toString(); } catch {
+    try { return new URL(`https://${raw}`).toString(); } catch { return 'https://example.com'; }
   }
 })();
 
 client.on('error', (err) => console.error('Client error:', err));
 
-// --- Chat Message Handlers ---
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
 
@@ -209,7 +370,6 @@ client.on('messageCreate', async (message) => {
   const isServerOwner = message.guild.ownerId === message.author.id;
   const isAuthUser = authUsers.includes(message.author.id) || isServerOwner;
 
-  // 1. Authorization Command: !add <user_id or @mention>
   if (content.startsWith('!add')) {
     if (!isAuthUser) return;
     try {
@@ -237,10 +397,8 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // ALL COMMANDS BELOW REQUIRE AUTHORIZATION
   if (!isAuthUser) return;
 
-  // 2. Key Revocation Command: !revoke <key>
   if (content.startsWith('!revoke')) {
     try {
       const args = rawContent.split(' ').slice(1);
@@ -268,11 +426,8 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // 3. !setup Prefix Command
   if (content === '!setup') {
-    const embed = new EmbedBuilder()
-      .setTitle('Z E N')
-      .setColor('#00FF7F');
+    const embed = new EmbedBuilder().setTitle('Z E N').setColor('#00FF7F');
 
     const downloadBtn = new ButtonBuilder()
       .setLabel('Download')
@@ -292,7 +447,6 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // 4. Manual Key Generation Handler
   if (content.startsWith('gen key') || content.startsWith('generate key') || content.includes('gen key') || content.startsWith('!gen')) {
     const durationData = parseDuration(rawContent);
     const generatedKey = `ZEN-${crypto.randomBytes(4).toString('hex').toUpperCase()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
@@ -326,210 +480,112 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// --- Slash Commands, Buttons, & Modals ---
 client.on('interactionCreate', async (interaction) => {
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === 'setup') {
-      const authUsers = loadAuthUsers();
-      const isServerOwner = interaction.guild?.ownerId === interaction.user.id;
-      if (!authUsers.includes(interaction.user.id) && !isServerOwner) {
-        return interaction.reply({ content: '❌ You are not authorized to use this command.', ephemeral: true });
-      }
-
-      const embed = new EmbedBuilder()
-        .setTitle('Z E N')
-        .setColor('#00FF7F');
-
-      const downloadBtn = new ButtonBuilder()
-        .setLabel('Download')
-        .setStyle(ButtonStyle.Link)
-        .setURL(DOWNLOAD_URL);
-
-      const resetHwidBtn = new ButtonBuilder()
-        .setCustomId('reset_hwid_btn')
-        .setLabel('Reset HWID / Redeem')
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('⚙️');
-
-      const row = new ActionRowBuilder().addComponents(downloadBtn, resetHwidBtn);
-      await interaction.reply({ embeds: [embed], components: [row] });
+  if (interaction.isChatInputCommand() && interaction.commandName === 'setup') {
+    const authUsers = loadAuthUsers();
+    const isServerOwner = interaction.guild?.ownerId === interaction.user.id;
+    if (!authUsers.includes(interaction.user.id) && !isServerOwner) {
+      return interaction.reply({ content: '❌ You are not authorized to use this command.', ephemeral: true });
     }
+
+    const embed = new EmbedBuilder().setTitle('Z E N').setColor('#00FF7F');
+    const downloadBtn = new ButtonBuilder().setLabel('Download').setStyle(ButtonStyle.Link).setURL(DOWNLOAD_URL);
+    const resetHwidBtn = new ButtonBuilder().setCustomId('reset_hwid_btn').setLabel('Reset HWID / Redeem').setStyle(ButtonStyle.Secondary).setEmoji('⚙️');
+    const row = new ActionRowBuilder().addComponents(downloadBtn, resetHwidBtn);
+
+    await interaction.reply({ embeds: [embed], components: [row] });
   }
 
-  if (interaction.isButton()) {
-    if (interaction.customId === 'reset_hwid_btn') {
-      const modal = new ModalBuilder()
-        .setCustomId('reset_hwid_modal')
-        .setTitle('Redeem Key / Reset HWID');
+  if (interaction.isButton() && interaction.customId === 'reset_hwid_btn') {
+    const modal = new ModalBuilder().setCustomId('reset_hwid_modal').setTitle('Redeem Key / Reset HWID');
+    const keyInput = new TextInputBuilder()
+      .setCustomId('hwid_key_input')
+      .setLabel('License Key')
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder('Enter your license key here')
+      .setRequired(true);
 
-      const keyInput = new TextInputBuilder()
-        .setCustomId('hwid_key_input')
-        .setLabel('License Key')
-        .setStyle(TextInputStyle.Short)
-        .setPlaceholder('Enter your license key here')
-        .setRequired(true);
-
-      const actionRow = new ActionRowBuilder().addComponents(keyInput);
-      modal.addComponents(actionRow);
-      await interaction.showModal(modal);
-    }
+    modal.addComponents(new ActionRowBuilder().addComponents(keyInput));
+    await interaction.showModal(modal);
   }
 
-  if (interaction.type === InteractionType.ModalSubmit) {
-    if (interaction.customId === 'reset_hwid_modal') {
-      const userKey = interaction.fields.getTextInputValue('hwid_key_input').trim();
-      const keysData = loadKeys();
-      const keyObj = keysData[userKey];
+  if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'reset_hwid_modal') {
+    const userKey = interaction.fields.getTextInputValue('hwid_key_input').trim();
+    const keysData = loadKeys();
+    const keyObj = keysData[userKey];
 
-      if (!keyObj) {
-        return interaction.reply({
-          content: `❌ **Invalid Key!** The key \`${userKey}\` was not found.`,
-          ephemeral: true
-        });
-      }
-
-      const now = new Date();
-      if (!keyObj.redeemed || !keyObj.expiresAt) {
-        keyObj.redeemed = true;
-        keyObj.redeemedBy = `${interaction.user.tag} (${interaction.user.id})`;
-        keyObj.redeemedAt = now.toISOString();
-
-        if (keyObj.isLifetime || keyObj.durationDays === null || keyObj.duration === 'Lifetime') {
-          keyObj.expiresAt = 'Never';
-          keyObj.isLifetime = true;
-        } else {
-          const days = keyObj.durationDays || 30;
-          const expireDate = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
-          keyObj.expiresAt = expireDate.toISOString();
-        }
-
-        saveKeys(keysData);
-
-        try {
-          const manualLogChannelId = process.env.CHANNEL_ID || '1554325937728790619';
-          const logChannel = await client.channels.fetch(manualLogChannelId);
-          if (logChannel) {
-            const expTimestamp = keyObj.isLifetime ? 'Never' : `<t:${Math.floor(new Date(keyObj.expiresAt).getTime() / 1000)}:F>`;
-            const redeemEmbed = new EmbedBuilder()
-              .setTitle('🔓 Key Redeemed / HWID Reset!')
-              .setColor('#FFD700')
-              .addFields(
-                { name: '🔑 Key', value: `\`${userKey}\``, inline: true },
-                { name: '👤 Redeemed By', value: `<@${interaction.user.id}>`, inline: true },
-                { name: '⏱️ Duration', value: `\`${keyObj.duration}\``, inline: true },
-                { name: '⏰ Expires At', value: expTimestamp, inline: false }
-              )
-              .setTimestamp();
-            await logChannel.send({ embeds: [redeemEmbed] });
-          }
-        } catch (e) { console.error('Failed to log redemption:', e); }
-      }
-
-      const expirationString = keyObj.isLifetime 
-        ? 'Never (Lifetime)' 
-        : `<t:${Math.floor(new Date(keyObj.expiresAt).getTime() / 1000)}:F> (<t:${Math.floor(new Date(keyObj.expiresAt).getTime() / 1000)}:R>)`;
-
-      await interaction.reply({
-        content: 
-          `✅ **Key Verified & HWID Reset!**\n\n` +
-          `🔑 **Key:** \`${userKey}\`\n` +
-          `⏳ **Duration:** ${keyObj.duration}\n` +
-          `📅 **Redeemed:** <t:${Math.floor(new Date(keyObj.redeemedAt).getTime() / 1000)}:R>\n` +
-          `⏰ **Expires:** ${expirationString}\n\n` +
-          `*Status: Active / Redeemed*`,
+    if (!keyObj) {
+      return interaction.reply({
+        content: `❌ **Invalid Key!** The key \`${userKey}\` was not found.`,
         ephemeral: true
       });
     }
-  }
-});
 
-// --- SellAuth Webhook Endpoint ---
-app.post('/webhook/sellauth', async (req, res) => {
-  try {
-    const payload = req.body || {};
-    const durationData = parseDuration(payload);
+    const appUsers = loadAppUsers();
+    const boundUser = Object.values(appUsers).find(u => u.key === userKey);
 
-    const generatedKey = `ZEN-${crypto.randomBytes(4).toString('hex').toUpperCase()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-    const createdAt = new Date().toISOString();
-
-    const dataObj = payload.data || payload;
-    const productName = dataObj.product_name || dataObj.product?.name || dataObj.product?.title || 'Z E N Enhancement';
-
-    const keysData = loadKeys();
-    keysData[generatedKey] = {
-      product: productName,
-      duration: durationData.label,
-      durationDays: durationData.durationDays,
-      createdAt: createdAt,
-      expiresAt: null,
-      isLifetime: durationData.isLifetime,
-      redeemed: false,
-      redeemedBy: null,
-      redeemedAt: null
-    };
-    saveKeys(keysData);
-
-    res.status(200).send(generatedKey);
-
-    const purchaseChannelId = process.env.PURCHASE_CHANNEL_ID || '1553943678014333090';
-
-    const channel = await client.channels.fetch(purchaseChannelId).catch(() => null);
-    if (channel) {
-      const embed = new EmbedBuilder()
-        .setTitle('🛒 New Purchase — Key Created!')
-        .setColor('#00FF7F')
-        .addFields(
-          { name: '📦 Product', value: `${keysData[generatedKey].product}`, inline: true },
-          { name: '⏳ Duration', value: `\`${durationData.label}\``, inline: true },
-          { name: '⏰ Expiration Date', value: `\`Timer starts upon redemption (${durationData.label})\``, inline: false },
-          { name: '🔑 Generated Key', value: `\`\`\`${generatedKey}\`\`\``, inline: false }
-        )
-        .setTimestamp();
-      await channel.send({ embeds: [embed] });
+    // If an app user account is tied to this key, reset its HWID binding
+    if (boundUser) {
+      boundUser.hwid = "";
+      saveAppUsers(appUsers);
     }
-  } catch (error) {
-    console.error('Webhook processing error:', error);
-    if (!res.headersSent) {
-      res.status(500).send('Webhook Processing Error');
+
+    const now = new Date();
+    if (!keyObj.redeemed || !keyObj.expiresAt) {
+      keyObj.redeemed = true;
+      keyObj.redeemedBy = `${interaction.user.tag} (${interaction.user.id})`;
+      keyObj.redeemedAt = now.toISOString();
+
+      if (keyObj.isLifetime || keyObj.durationDays === null || keyObj.duration === 'Lifetime') {
+        keyObj.expiresAt = 'Never';
+        keyObj.isLifetime = true;
+      } else {
+        const days = keyObj.durationDays || 1;
+        keyObj.expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+      }
+
+      saveKeys(keysData);
+
+      try {
+        const manualLogChannelId = process.env.CHANNEL_ID || '1554325937728790619';
+        const logChannel = await client.channels.fetch(manualLogChannelId);
+        if (logChannel) {
+          const expTimestamp = keyObj.isLifetime ? 'Never' : `<t:${Math.floor(new Date(keyObj.expiresAt).getTime() / 1000)}:F>`;
+          const redeemEmbed = new EmbedBuilder()
+            .setTitle('🔓 Key Redeemed / HWID Reset!')
+            .setColor('#FFD700')
+            .addFields(
+              { name: '🔑 Key', value: `\`${userKey}\``, inline: true },
+              { name: '👤 Redeemed By', value: `<@${interaction.user.id}>`, inline: true },
+              { name: '⏱️ Duration', value: `\`${keyObj.duration}\``, inline: true },
+              { name: '⏰ Expires At', value: expTimestamp, inline: false }
+            )
+            .setTimestamp();
+          await logChannel.send({ embeds: [redeemEmbed] });
+        }
+      } catch (e) { console.error('Failed to log redemption:', e); }
     }
+
+    const expirationString = keyObj.isLifetime 
+      ? 'Never (Lifetime)' 
+      : `<t:${Math.floor(new Date(keyObj.expiresAt).getTime() / 1000)}:F> (<t:${Math.floor(new Date(keyObj.expiresAt).getTime() / 1000)}:R>)`;
+
+    const extraMsg = boundUser ? `\n\n👤 **Bound User:** \`${boundUser.username}\` (HWID binding unlinked! Log in on new PC to rebind.)` : '';
+
+    await interaction.reply({
+      content: 
+        `✅ **Key Verified & HWID Reset!**\n\n` +
+        `🔑 **Key:** \`${userKey}\`\n` +
+        `⏳ **Duration:** ${keyObj.duration}\n` +
+        `📅 **Redeemed:** <t:${Math.floor(new Date(keyObj.redeemedAt).getTime() / 1000)}:R>\n` +
+        `⏰ **Expires:** ${expirationString}` +
+        extraMsg,
+      ephemeral: true
+    });
   }
-});
-
-// --- API Endpoint for EXE Key Verification ---
-app.post('/api/verify-key', (req, res) => {
-  const { key } = req.body;
-  if (!key) return res.status(400).json({ success: false, message: 'Key required' });
-
-  const keysData = loadKeys();
-  const keyObj = keysData[key];
-
-  if (!keyObj) {
-    return res.status(404).json({ success: false, message: 'Invalid Key' });
-  }
-
-  if (!keyObj.redeemed) {
-    return res.status(403).json({ success: false, message: 'Key not redeemed yet. Redeem in Discord first.' });
-  }
-
-  const isExpired = !keyObj.isLifetime && (new Date() > new Date(keyObj.expiresAt));
-
-  if (isExpired) {
-    return res.status(403).json({ success: false, message: 'Key Expired' });
-  }
-
-  res.json({
-    success: true,
-    key: key,
-    duration: keyObj.duration,
-    expiresAt: keyObj.expiresAt,
-    isLifetime: keyObj.isLifetime,
-    redeemed: keyObj.redeemed
-  });
 });
 
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Web server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Web server running on port ${PORT}`));
 
 client.login(process.env.DISCORD_TOKEN);
