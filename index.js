@@ -18,6 +18,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const axios = require('axios'); // Added for GitHub API
 
 const client = new Client({
   intents: [
@@ -36,6 +37,47 @@ const AUTH_FILE = path.join(__dirname, 'auth_users.json');
 // Hardcoded authorized user IDs
 const PRE_AUTHORIZED_USERS = ['1476771914751017163', '1498853751354560634'];
 
+// --- GitHub Sync Helper ---
+async function syncKeysToGitHub(keysData) {
+  const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+  if (!GITHUB_TOKEN) {
+    console.log('⚠ Skipping GitHub sync: GITHUB_TOKEN is not set in environment variables.');
+    return;
+  }
+
+  const REPO_OWNER = 'seanmyro';
+  const REPO_NAME = 'zen';
+  const FILE_PATH = 'keys.json';
+  const url = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${FILE_PATH}`;
+
+  const headers = {
+    'Authorization': `Bearer ${GITHUB_TOKEN}`,
+    'User-Agent': 'zen-bot',
+    'Accept': 'application/vnd.github+json'
+  };
+
+  try {
+    // 1. Get current file SHA hash from GitHub
+    const getRes = await axios.get(url, { headers });
+    const currentSha = getRes.data.sha;
+
+    // 2. Extract key strings into array format: ["ZEN-XXX", "ZEN-YYY"]
+    const keyArray = Object.keys(keysData);
+    const updatedContent = Buffer.from(JSON.stringify(keyArray, null, 2)).toString('base64');
+
+    // 3. Push updated array back to GitHub
+    await axios.put(url, {
+      message: 'Bot auto-updated keys.json',
+      content: updatedContent,
+      sha: currentSha
+    }, { headers });
+
+    console.log('✅ Successfully synced keys.json to GitHub!');
+  } catch (error) {
+    console.error('❌ GitHub Sync Error:', error.response ? error.response.data : error.message);
+  }
+}
+
 // --- File Handling ---
 function loadKeys() {
   if (!fs.existsSync(KEYS_FILE)) {
@@ -51,6 +93,8 @@ function loadKeys() {
 
 function saveKeys(keysData) {
   fs.writeFileSync(KEYS_FILE, JSON.stringify(keysData, null, 2));
+  // Auto-sync to GitHub whenever keys file is saved
+  syncKeysToGitHub(keysData);
 }
 
 function loadAuthUsers() {
@@ -74,7 +118,6 @@ function parseDuration(input) {
   let str = '';
   
   if (typeof input === 'object' && input !== null) {
-    // Unnest SellAuth's data object if present
     const dataObj = input.data || input;
 
     const parts = [
@@ -109,7 +152,6 @@ function parseDuration(input) {
     return { label: '1 Day', durationDays: 1, isLifetime: false };
   }
 
-  // Fallback to 1 Day if unspecified
   return { label: '1 Day', durationDays: 1, isLifetime: false };
 }
 
@@ -219,7 +261,7 @@ client.on('messageCreate', async (message) => {
       const embed = new EmbedBuilder()
         .setTitle('🚫 Key Revoked')
         .setColor('#FF0033')
-        .setDescription(`License key \`${targetKey}\` has been successfully revoked.`)
+        .setDescription(`License key \`${targetKey}\` has been successfully revoked and removed from GitHub.`)
         .setTimestamp();
       await message.reply({ embeds: [embed] });
     } catch (err) { console.error(err); }
@@ -251,7 +293,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // 4. Manual Key Generation Handler
-  if (content.startsWith('gen key') || content.startsWith('generate key') || content.includes('gen key')) {
+  if (content.startsWith('gen key') || content.startsWith('generate key') || content.includes('gen key') || content.startsWith('!gen')) {
     const durationData = parseDuration(rawContent);
     const generatedKey = `ZEN-${crypto.randomBytes(4).toString('hex').toUpperCase()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
     const createdAt = new Date().toISOString();
@@ -346,7 +388,6 @@ client.on('interactionCreate', async (interaction) => {
         });
       }
 
-      // Calculate expiration starting NOW if not already active
       const now = new Date();
       if (!keyObj.redeemed || !keyObj.expiresAt) {
         keyObj.redeemed = true;
@@ -364,7 +405,6 @@ client.on('interactionCreate', async (interaction) => {
 
         saveKeys(keysData);
 
-        // Send redemption log
         try {
           const manualLogChannelId = process.env.CHANNEL_ID || '1554325937728790619';
           const logChannel = await client.channels.fetch(manualLogChannelId);
@@ -429,10 +469,8 @@ app.post('/webhook/sellauth', async (req, res) => {
     };
     saveKeys(keysData);
 
-    // Return key directly to SellAuth display page
     res.status(200).send(generatedKey);
 
-    // Purchase Log Channel ID
     const purchaseChannelId = process.env.PURCHASE_CHANNEL_ID || '1553943678014333090';
 
     const channel = await client.channels.fetch(purchaseChannelId).catch(() => null);
